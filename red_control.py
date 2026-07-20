@@ -96,14 +96,17 @@ EXPOSURE_US = 5000     # 曝光(us), 参考代码5000
 GAIN_VAL = 12.0        # 增益, 参考代码12
 
 # --- 用户标记点 ---
-origin_point = None           # 原点 (鼠标标记)
-square_corners = [None, None, None, None]  # 正方形4角点
+# 5个点: 0=原点, 1=左上, 2=右上, 3=右下, 4=左下 (顺时针)
+MARK_POINT_NAMES = ["Origin", "TL", "TR", "BR", "BL"]
+mark_points = [None, None, None, None, None]  # 5个标记点
+current_mark_idx = 0          # 当前正在标记第几个点 (0~4)
 
 # --- 检测结果缓存 ---
 detected_outer_rect = None    # A4外矩形角点
 detected_inner_rect = None    # A4内矩形角点
 red_spot_pos = None           # 红色光斑位置
 enable_a4_detect = True       # A4检测开关
+work_mode = "mark"              # 工作模式: "mark"=标记点位, "detect"=识别矩形+光斑
 
 # 调试开关
 show_binary = False
@@ -452,26 +455,26 @@ def pack_frame(cmd_id, flags, data_floats):
     buf.append(cs)
     return bytes(buf)
 
-def send_points_to_mcu(origin, square_pts, outer_rect, inner_rect, red_spot):
+def send_points_to_mcu(outer_rect, inner_rect, red_spot):
     """发送全部数据到下位机"""
     global serial_port, serial_enabled
     if not serial_enabled:
         print("[SER] 串口未启用, 仅打印数据")
-        _print_data(origin, square_pts, outer_rect, inner_rect, red_spot)
+        _print_data(outer_rect, inner_rect, red_spot)
         return
 
     # 帧1: 原点 (cmd=0x0100)
-    if origin is not None:
-        data = [float(origin[0]), float(origin[1])] + [0.0]*10
+    if mark_points[0] is not None:
+        data = [float(mark_points[0][0]), float(mark_points[0][1])] + [0.0]*10
         serial_port.write(pack_frame(0x0100, 0x0000, data))
-        print(f"[SER] 发送原点: ({origin[0]}, {origin[1]})")
+        print(f"[SER] 发送原点: {mark_points[0]}")
 
     # 帧2: 正方形4角点 (cmd=0x0101)
-    if all(p is not None for p in square_pts):
+    if all(p is not None for p in mark_points[1:5]):
         data = []
-        for p in square_pts:
+        for p in mark_points[1:5]:
             data.extend([float(p[0]), float(p[1])])
-        data += [0.0] * (12 - len(data))  # 补齐12个float
+        data += [0.0] * (12 - len(data))
         serial_port.write(pack_frame(0x0101, 0x0000, data))
         print(f"[SER] 发送正方形4角点")
 
@@ -498,13 +501,12 @@ def send_points_to_mcu(origin, square_pts, outer_rect, inner_rect, red_spot):
         data = [float(red_spot[0]), float(red_spot[1])] + [0.0]*10
         serial_port.write(pack_frame(0x0104, 0x0000, data))
 
-def _print_data(origin, square_pts, outer_rect, inner_rect, red_spot):
+def _print_data(outer_rect, inner_rect, red_spot):
     """无串口时打印数据到控制台"""
     print("=" * 50)
-    if origin:
-        print(f"原点: ({origin[0]}, {origin[1]})")
-    if all(p is not None for p in square_pts):
-        print(f"正方形角点: {square_pts}")
+    for i in range(5):
+        if mark_points[i] is not None:
+            print(f"点{i}({MARK_POINT_NAMES[i]}): {mark_points[i]}")
     if outer_rect is not None:
         print(f"A4外矩形: {outer_rect.tolist()}")
     if inner_rect is not None:
@@ -538,29 +540,44 @@ def mouse_callback(event, x, y, flags, param):
 # 可视化绘制
 # =============================================================================
 def draw_marked_points(image):
-    """绘制用户标记的原点和正方形角点"""
-    colors = [(0, 0, 255), (255, 0, 0), (0, 255, 0), (255, 255, 0), (255, 0, 255)]
+    """绘制5个标记点: 0=原点(红) 1-4=正方形四角(顺时针)"""
+    colors = [
+        (0, 0, 255),      # 原点: 红色
+        (255, 0, 0),      # 左上: 蓝色
+        (0, 255, 0),      # 右上: 绿色
+        (255, 255, 0),    # 右下: 青色
+        (255, 0, 255),    # 左下: 紫色
+    ]
+    labels = ["O", "1", "2", "3", "4"]
 
-    # 原点
-    if origin_point is not None:
-        cv2.circle(image, origin_point, 8, colors[0], 2)
-        cv2.circle(image, origin_point, 3, colors[0], -1)
-        cv2.putText(image, "Origin", (origin_point[0]+12, origin_point[1]-5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[0], 1)
-
-    # 正方形4角
-    for i, pt in enumerate(square_corners):
+    for i in range(5):
+        pt = mark_points[i]
         if pt is not None:
-            cv2.circle(image, pt, 8, colors[i+1], 2)
-            cv2.circle(image, pt, 3, colors[i+1], -1)
-            cv2.putText(image, f"P{i+1}", (pt[0]+12, pt[1]-5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[i+1], 1)
+            c = colors[i]
+            cv2.circle(image, pt, 5, c, 2)
+            cv2.circle(image, pt, 2, c, -1)
+            cv2.putText(image, labels[i], (pt[0]+8, pt[1]-4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1)
 
-    # 正方形连线
-    valid_pts = [p for p in square_corners if p is not None]
-    if len(valid_pts) >= 2:
-        cv2.polylines(image, [np.array(valid_pts)], len(valid_pts) == 4,
-                      (255, 255, 0), 2)
+    # 正方形四角连线 (点1-4)
+    square_pts = [p for p in mark_points[1:5] if p is not None]
+    if len(square_pts) >= 2:
+        closed = len(square_pts) == 4
+        cv2.polylines(image, [np.array(square_pts)], closed, (255, 255, 0), 2)
+
+    # 点击预览 (未确认前显示)
+    if work_mode == "mark" and clicked_point is not None:
+        cv2.circle(image, clicked_point, 6, (0, 255, 255), 2)
+        cv2.circle(image, clicked_point, 2, (0, 255, 255), -1)
+        name = MARK_POINT_NAMES[current_mark_idx] if current_mark_idx < 5 else ""
+        cv2.putText(image, name, (clicked_point[0]+10, clicked_point[1]-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+    # 当前正在标记的提示
+    if work_mode == "mark" and current_mark_idx < 5:
+        name = MARK_POINT_NAMES[current_mark_idx]
+        cv2.putText(image, f">>> Click to mark: {name} (ENTER to confirm) <<<",
+                    (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
 
 def draw_detected_rectangles(image):
@@ -600,8 +617,7 @@ def draw_status_bar(image, extra_lines=None):
     lines = [
         f"Binary:{BINARY_THRESHOLD} | Canny:[{CANNY_LOWER},{CANNY_UPPER}] | RedHSV: H±{RED_H_TOL} S>{RED_S_LOW} V>{RED_V_LOW}",
         f"Serial:{'ON' if serial_enabled else 'OFF'} | A4Detect:{'ON' if enable_a4_detect else 'OFF'}",
-        f"Origin:{'OK' if origin_point else '--'} | "
-        f"Square:{sum(1 for p in square_corners if p is not None)}/4"
+        f"Mark: {sum(1 for p in mark_points if p is not None)}/5"
     ]
     if extra_lines:
         lines.extend(extra_lines)
@@ -617,8 +633,8 @@ print("[INFO] Mouse callback + Drawing OK")
 def main():
     global BINARY_THRESHOLD, enable_a4_detect, show_binary, show_edges, show_red_mask
     global CANNY_LOWER, CANNY_UPPER
-    global RED_S_LOW, RED_V_LOW
-    global origin_point, square_corners, clicked_point
+    global RED_S_LOW, RED_V_LOW, work_mode
+    global mark_points, current_mark_idx, clicked_point
     global detected_outer_rect, detected_inner_rect, red_spot_pos
     global serial_enabled
 
@@ -653,16 +669,13 @@ def main():
     SEND_INTERVAL = 5          # 每N帧发送一次红色光斑
 
     print("\n操作说明:")
-    print("  鼠标点击 + 数字键标记:")
-    print("    '0' -> 标记原点")
-    print("    '1'~'4' -> 标记正方形角点")
-    print("  'S' -> 发送全部数据到下位机")
-    print("  'R' -> 重置所有标记点")
-    print("  'C' -> 切换A4矩形检测")
-    print("  调试窗口:")
-    print("    'B' -> 二值化  'E' -> 边缘  'H' -> 红色光斑HSV掩膜")
-    print("    '+/-' -> 调整二值化阈值")
-    print("  'Q' -> 退出")
+    print("  空格键 -> 切换模式: MARK(标记点位) / DETECT(识别矩形+光斑)")
+    print("  标记模式 (MARK):")
+    print("    鼠标点击 + '0'->原点  '1'~'4'->正方形角点")
+    print("  识别模式 (DETECT):")
+    print("    自动识别A4内外矩形 + 红色光斑追踪")
+    print("  'S' -> 发送全部数据  'R' -> 重置  'Q' -> 退出")
+    print("  调试: 'B'二值化 'E'边缘 'H'红色掩膜 '+/-'阈值")
     print("-" * 55)
 
     # ====== 主循环 ======
@@ -681,7 +694,7 @@ def main():
         binary_img = None
         edges_img = None
 
-        if enable_a4_detect:
+        if work_mode == "detect" and enable_a4_detect:
             combined_img, binary_img, edges_img = preprocess_image(frame)
             contours, hierarchy = cv2.findContours(
                 combined_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -700,7 +713,10 @@ def main():
                 pass
 
         # --- 红色光斑检测 ---
-        red_spot_pos, red_mask = detect_red_spot(frame)
+        if work_mode == "detect":
+            red_spot_pos, red_mask = detect_red_spot(frame)
+        else:
+            red_spot_pos, red_mask = None, None
 
         # --- 处理鼠标点击 ---
         # (在主循环中处理, 通过键盘数字键分配)
@@ -709,8 +725,7 @@ def main():
         if serial_enabled and red_spot_pos is not None:
             send_counter += 1
             if send_counter >= SEND_INTERVAL:
-                send_points_to_mcu(origin_point, square_corners,
-                                   detected_outer_rect, detected_inner_rect,
+                send_points_to_mcu(detected_outer_rect, detected_inner_rect,
                                    red_spot_pos)
                 send_counter = 0
 
@@ -738,9 +753,10 @@ def main():
             status_extra.append(f"A4 Outer: {len(a4_rects)} rects found")
         draw_status_bar(display, status_extra)
 
-        # 窗口标题
-        cv2.putText(display, "23E Red Laser Control", (10, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        # 窗口标题 + 模式
+        mode_color = (0, 255, 0) if work_mode == "detect" else (255, 200, 0)
+        cv2.putText(display, f"23E Red Control [{work_mode.upper()}]", (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_color, 2)
 
         # --- 显示 ---
         cv2.imshow("23E Red Control", display)
@@ -768,32 +784,41 @@ def main():
             print("用户退出")
             break
 
-        elif key == ord('0'):
-            if clicked_point is not None:
-                origin_point = clicked_point
-                print(f"[MARK] 原点: {origin_point}")
-
-        elif key in [ord('1'), ord('2'), ord('3'), ord('4')]:
-            idx = key - ord('1')  # 0, 1, 2, 3
-            if clicked_point is not None:
-                square_corners[idx] = clicked_point
-                print(f"[MARK] 正方形角点{idx+1}: {clicked_point}")
+        elif key == 13:  # ENTER键: 确认当前标记点
+            if work_mode == "mark" and clicked_point is not None:
+                mark_points[current_mark_idx] = clicked_point
+                name = MARK_POINT_NAMES[current_mark_idx]
+                print(f"[MARK] {name}(点{current_mark_idx}): {clicked_point}")
+                current_mark_idx += 1
+                if current_mark_idx >= 5:
+                    print("[MARK] 全部5个点已标记完成! 自动切换到识别模式")
+                    work_mode = "detect"
+                clicked_point = None  # 清空, 等待下一次点击
 
         elif key == ord('s') or key == ord('S'):
             # 发送全部数据
-            send_points_to_mcu(origin_point, square_corners,
-                               detected_outer_rect, detected_inner_rect,
+            send_points_to_mcu(detected_outer_rect, detected_inner_rect,
                                red_spot_pos)
             print("[SEND] 数据已发送")
 
+        elif key == ord(' '):  # 空格切换模式
+            if work_mode == "mark":
+                work_mode = "detect"
+                print("[MODE] 切换到识别模式 - A4矩形+红色光斑检测")
+            else:
+                work_mode = "mark"
+                print("[MODE] 切换到标记模式 - 标记原点+正方形角点")
+
         elif key == ord('r') or key == ord('R'):
-            # 重置
-            origin_point = None
-            square_corners = [None, None, None, None]
+            # 重置标记
+            for i in range(5):
+                mark_points[i] = None
+            current_mark_idx = 0
             clicked_point = None
             detected_outer_rect = None
             detected_inner_rect = None
-            print("[RESET] 所有标记点已重置")
+            work_mode = "mark"
+            print("[RESET] 所有标记点已重置, 回到标记模式")
 
         elif key == ord('c') or key == ord('C'):
             enable_a4_detect = not enable_a4_detect
@@ -853,8 +878,7 @@ def main():
 
         elif key == ord('p') or key == ord('P'):
             # 打印当前所有数据
-            _print_data(origin_point, square_corners,
-                       detected_outer_rect, detected_inner_rect, red_spot_pos)
+            _print_data(detected_outer_rect, detected_inner_rect, red_spot_pos)
 
         # --- FPS ---
         if frame_count % 60 == 0:
