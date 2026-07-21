@@ -421,7 +421,7 @@ class PathGenerator:
 class SerialComm:
     """与MCU的串口通信"""
     
-    def __init__(self, port="/dev/ttyTHS1", baudrate=921600):
+    def __init__(self, port="/dev/ttyTHS1", baudrate=115200):
         self.port = port
         self.baudrate = baudrate
         self.ser = None
