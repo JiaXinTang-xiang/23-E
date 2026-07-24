@@ -18,8 +18,6 @@
   键盘 '+/-'    - 调整二值化阈值
   键盘 'B'      - 切换二值化预览
   键盘 'Q'      - 退出
-
-参考: 视觉代码带注释.py (江南大学团队)
 """
 
 import sys, time, cv2, numpy as np, os, struct
@@ -90,6 +88,7 @@ def _build_red_hsv_ranges():
 # --- 串口参数 ---
 SERIAL_PORT = "/dev/ttyTHS1"
 SERIAL_BAUDRATE = 115200
+SERIAL_DEBUG_HEX = False  # True时打印每个发送帧，供与MCU逐字节核对
 
 # --- 相机参数 ---
 CAM_WIDTH, CAM_HEIGHT = 640, 480
@@ -426,7 +425,19 @@ def init_serial(port=SERIAL_PORT, baudrate=SERIAL_BAUDRATE):
     global serial_port, serial_enabled
     try:
         import serial
-        serial_port = serial.Serial(port, baudrate, timeout=0.05)
+        # 明确使用最常见的 8N1，避免串口库配置被环境默认值影响。
+        serial_port = serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            timeout=0.05,
+            write_timeout=1,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
+        )
         serial_enabled = True
         print(f"[SER] {port} @ {baudrate} OK")
         return True
@@ -436,17 +447,32 @@ def init_serial(port=SERIAL_PORT, baudrate=SERIAL_BAUDRATE):
         return False
 
 def pack_frame(cmd_id, flags, data_floats):
-    """打包数据帧, 协议同参考代码"""
+    """按 ``A5 | length | cmd | flags | float32[N]`` 打包一帧。
+
+    ``length`` 是帧头和长度字段之后的字节数。下位机按这个长度收取，
+    因此这里不能额外附加校验字节；否则下一帧会从校验字节开始而失步。
+    """
     n = len(data_floats)
     length = 2 + 2 + 4 * n  # cmd_id(2) + flags(2) + floats(4*n)
     buf = bytearray([0xA5, length & 0xFF])
     buf += struct.pack('<HH', cmd_id, flags)
     for f in data_floats:
         buf += struct.pack('<f', f)
-    # 简单校验
-    cs = sum(buf) & 0xFF
-    buf.append(cs)
     return bytes(buf)
+
+def _send_frame(cmd_id, data_floats):
+    """发送完整帧，并在调试模式下输出实际发出的字节。"""
+    frame = pack_frame(cmd_id, 0x0000, data_floats)
+    expected_size = 2 + frame[1]
+    if len(frame) != expected_size:
+        raise ValueError(
+            f"帧长错误: length={frame[1]}, 实际={len(frame)}, 应为={expected_size}")
+
+    written = serial_port.write(frame)
+    if written != len(frame):
+        raise IOError(f"串口短写: {written}/{len(frame)} 字节")
+    if SERIAL_DEBUG_HEX:
+        print(f"[SER TX] cmd=0x{cmd_id:04X} len={len(frame)}: {frame.hex(' ')}")
 
 def send_points_to_mcu(outer_rect, inner_rect, red_spot):
     """发送A4矩形+红色光斑数据到下位机"""
@@ -462,7 +488,7 @@ def send_points_to_mcu(outer_rect, inner_rect, red_spot):
         for p in outer_rect:
             data.extend([float(p[0]), float(p[1])])
         data += [0.0] * (12 - len(data))
-        serial_port.write(pack_frame(0x0102, 0x0000, data))
+        _send_frame(0x0102, data)
         print(f"[SER] 发送A4外矩形")
 
     # 帧4: A4内矩形 (cmd=0x0103)
@@ -471,13 +497,13 @@ def send_points_to_mcu(outer_rect, inner_rect, red_spot):
         for p in inner_rect:
             data.extend([float(p[0]), float(p[1])])
         data += [0.0] * (12 - len(data))
-        serial_port.write(pack_frame(0x0103, 0x0000, data))
+        _send_frame(0x0103, data)
         print(f"[SER] 发送A4内矩形")
 
     # 帧5: 红色光斑 (cmd=0x0104) - 持续发送
     if red_spot is not None:
         data = [float(red_spot[0]), float(red_spot[1])] + [0.0]*10
-        serial_port.write(pack_frame(0x0104, 0x0000, data))
+        _send_frame(0x0104, data)
 
 def _print_data(outer_rect, inner_rect, red_spot):
     """无串口时打印数据到控制台"""
