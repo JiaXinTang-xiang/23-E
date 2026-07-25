@@ -39,9 +39,12 @@ def main():
     ) as uart:
         uart.reset_output_buffer()
         while True:
-            written = uart.write(TEST_FRAME)
-            uart.flush()
-            print(f"written={written}/{len(TEST_FRAME)}")
+            written = 0
+            for value in TEST_FRAME:
+                count = uart.write(bytes((value,)))
+                uart.flush()
+                written += count
+            print(f"safe byte-write={written}/{len(TEST_FRAME)}")
             time.sleep(1)
 
 

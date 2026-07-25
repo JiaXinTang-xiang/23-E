@@ -89,6 +89,7 @@ def _build_red_hsv_ranges():
 SERIAL_PORT = "/dev/ttyTHS1"
 SERIAL_BAUDRATE = 921600
 SERIAL_DEBUG_HEX = True  # 打印实际交给串口驱动的每个字节
+SERIAL_SAFE_BYTE_WRITE = True  # Jetson ttyTHS批量写入异常时逐字节发送
 
 # --- 相机参数 ---
 CAM_WIDTH, CAM_HEIGHT = 640, 480
@@ -479,15 +480,22 @@ def _send_frame(cmd_id, data_floats):
     if SERIAL_DEBUG_HEX:
         print(f"[SER TX] cmd=0x{cmd_id:04X} len={len(frame)}: {frame.hex(' ')}")
 
-    # write() 理论上会写完，但这里仍按返回值循环，确保54字节全部交给驱动。
-    view = memoryview(frame)
-    total_written = 0
-    while total_written < len(frame):
-        written = serial_port.write(view[total_written:])
-        if not written:
-            raise IOError(f"串口短写: {total_written}/{len(frame)} 字节")
-        total_written += written
-    serial_port.flush()
+    if SERIAL_SAFE_BYTE_WRITE:
+        # 每个字节单独写入并等待发送，避开 ttyTHS 批量写入/FIFO 路径。
+        for index, value in enumerate(frame):
+            written = serial_port.write(bytes((value,)))
+            if written != 1:
+                raise IOError(f"串口短写: {index}/{len(frame)} 字节")
+            serial_port.flush()
+    else:
+        view = memoryview(frame)
+        total_written = 0
+        while total_written < len(frame):
+            written = serial_port.write(view[total_written:])
+            if not written:
+                raise IOError(f"串口短写: {total_written}/{len(frame)} 字节")
+            total_written += written
+        serial_port.flush()
 
 def send_points_to_mcu(outer_rect, inner_rect, red_spot):
     """发送A4矩形+红色光斑数据到下位机"""
