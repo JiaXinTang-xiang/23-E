@@ -87,9 +87,10 @@ def _build_red_hsv_ranges():
 
 # --- 串口参数 ---
 SERIAL_PORT = "/dev/ttyTHS1"
-SERIAL_BAUDRATE = 921600
+SERIAL_BAUDRATE = 115200
 SERIAL_DEBUG_HEX = False  # True时打印完整发送帧
 SERIAL_SAFE_BYTE_WRITE = True  # 保留旧协议，仅避开当前Jetson的批量写入异常
+COORD_LOG_INTERVAL_S = 0.5  # 坐标日志限频，避免控制台刷屏
 
 # --- 相机参数 ---
 CAM_WIDTH, CAM_HEIGHT = 640, 480
@@ -560,6 +561,27 @@ def _print_data(outer_rect, inner_rect, red_spot):
         print(f"红色光斑: ({red_spot[0]}, {red_spot[1]})")
     print("=" * 50)
 
+
+def _format_rect_points(rect):
+    """将四角点格式化为简洁坐标文本。"""
+    if rect is None:
+        return "None"
+    return " ".join(f"({int(p[0])},{int(p[1])})" for p in rect)
+
+
+def print_a4_coordinates(outer_rect, inner_rect):
+    """A4锁定时打印一次完整内外框坐标。"""
+    print(f"[COORD] A4外框: {_format_rect_points(outer_rect)}")
+    print(f"[COORD] A4内框: {_format_rect_points(inner_rect)}")
+
+
+def print_red_coordinate(red_spot):
+    """限频打印当前红色光斑坐标。"""
+    if red_spot is None:
+        print("[COORD] 红点: 未检测")
+    else:
+        print(f"[COORD] 红点: ({red_spot[0]}, {red_spot[1]})")
+
 def close_serial():
     global serial_port, serial_enabled, serial_thread
     serial_stop_event.set()
@@ -685,8 +707,7 @@ def main():
     cv2.setNumThreads(4)
 
     # --- 状态变量 ---
-    frame_count = 0
-    start_time = time.time()
+    last_coord_log_time = 0.0
     send_counter = 0
     SEND_INTERVAL = 5          # 每5个图像帧发送一次
     a4_locked = False          # A4内外矩形是否已锁定(只识别一次)
@@ -708,7 +729,6 @@ def main():
             time.sleep(0.001)
             continue
         frame = cv2.resize(frame, (CAM_WIDTH, CAM_HEIGHT))
-        frame_count += 1
 
         # --- A4矩形检测 ---
         a4_rects = []
@@ -732,6 +752,7 @@ def main():
                 detected_outer_rect = a4_rects[1][1]  # 外矩形角点
                 a4_locked = True
                 print("[A4] 8点已锁定, 不再更新检测")
+                print_a4_coordinates(detected_outer_rect, detected_inner_rect)
             elif len(a4_rects) == 1:
                 detected_outer_rect = a4_rects[0][1]
                 detected_inner_rect = None
@@ -740,6 +761,12 @@ def main():
 
         # --- 红色光斑检测 ---
         red_spot_pos, red_mask = detect_red_spot(frame)
+
+        # 每0.5秒打印一次红点坐标，避免控制台刷屏影响视觉。
+        now = time.time()
+        if now - last_coord_log_time >= COORD_LOG_INTERVAL_S:
+            print_red_coordinate(red_spot_pos)
+            last_coord_log_time = now
 
         # --- 处理鼠标点击 ---
         # (在主循环中处理, 通过键盘数字键分配)
@@ -877,12 +904,6 @@ def main():
         elif key == ord('p') or key == ord('P'):
             # 打印当前所有数据
             _print_data(detected_outer_rect, detected_inner_rect, red_spot_pos)
-
-        # --- FPS ---
-        if frame_count % 60 == 0:
-            elapsed = time.time() - start_time
-            fps = frame_count / elapsed if elapsed > 0 else 0
-            print(f"[FPS] {fps:.1f} | Thresh:{BINARY_THRESHOLD}")
 
     # ====== 清理 ======
     cv2.destroyAllWindows()
