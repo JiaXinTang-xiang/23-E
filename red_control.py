@@ -20,8 +20,10 @@
   键盘 'Q'      - 退出
 """
 
-import sys, time, cv2, numpy as np, os, struct
+import sys, time, cv2, numpy as np, os, struct, threading
 from ctypes import *
+
+import protocol_v1 as proto
 
 # =============================================================================
 # 海康相机SDK导入
@@ -88,8 +90,12 @@ def _build_red_hsv_ranges():
 # --- 串口参数 ---
 SERIAL_PORT = "/dev/ttyTHS1"
 SERIAL_BAUDRATE = 921600
-SERIAL_DEBUG_HEX = True  # 打印实际交给串口驱动的每个字节
+SERIAL_DEBUG_HEX = False  # HEX打印会明显拖慢实时视觉
 SERIAL_SAFE_BYTE_WRITE = True  # Jetson ttyTHS批量写入异常时逐字节发送
+PROTOCOL_MODE = "v1"  # "v1" 为新通用协议，"legacy" 兼容旧54字节协议
+PROTOCOL_SRC = proto.DEVICE_VISION
+PROTOCOL_DST = proto.DEVICE_MAIN_MCU
+HEARTBEAT_INTERVAL_S = 0.5
 
 # --- 相机参数 ---
 CAM_WIDTH, CAM_HEIGHT = 640, 480
@@ -420,10 +426,15 @@ print("[INFO] Rectangle detection + red spot detection OK")
 # =============================================================================
 serial_port = None
 serial_enabled = False
+serial_thread = None
+serial_stop_event = threading.Event()
+serial_condition = threading.Condition()
+serial_pending_frames = {}
+protocol_sequence = proto.SequenceCounter()
 
 def init_serial(port=SERIAL_PORT, baudrate=SERIAL_BAUDRATE):
     """初始化串口"""
-    global serial_port, serial_enabled
+    global serial_port, serial_enabled, serial_thread
     try:
         import serial
         # 明确使用最常见的 8N1，避免串口库配置被环境默认值影响。
@@ -440,6 +451,12 @@ def init_serial(port=SERIAL_PORT, baudrate=SERIAL_BAUDRATE):
             dsrdtr=False,
         )
         serial_enabled = True
+        serial_stop_event.clear()
+        with serial_condition:
+            serial_pending_frames.clear()
+        serial_thread = threading.Thread(
+            target=_serial_worker, name="serial-tx", daemon=True)
+        serial_thread.start()
         print(f"[SER] {port} @ {baudrate} OK")
         return True
     except Exception as e:
@@ -447,8 +464,8 @@ def init_serial(port=SERIAL_PORT, baudrate=SERIAL_BAUDRATE):
         serial_enabled = False
         return False
 
-def pack_frame(cmd_id, flags, data_floats):
-    """按 ``A5 | length | cmd | flags | float32[N]`` 打包一帧。
+def pack_legacy_frame(cmd_id, flags, data_floats):
+    """兼容旧 ``A5 | length | cmd | flags | float32[N]`` 协议。
 
     ``length`` 是帧头和长度字段之后的字节数。下位机按这个长度收取，
     因此这里不能额外附加校验字节；否则下一帧会从校验字节开始而失步。
@@ -469,19 +486,10 @@ def pack_frame(cmd_id, flags, data_floats):
         *floats,
     )
 
-def _send_frame(cmd_id, data_floats):
-    """发送完整帧，并在调试模式下输出实际发出的字节。"""
-    frame = pack_frame(cmd_id, 0x0000, data_floats)
-    expected_size = 2 + frame[1]
-    if len(frame) != expected_size:
-        raise ValueError(
-            f"帧长错误: length={frame[1]}, 实际={len(frame)}, 应为={expected_size}")
-
-    if SERIAL_DEBUG_HEX:
-        print(f"[SER TX] cmd=0x{cmd_id:04X} len={len(frame)}: {frame.hex(' ')}")
-
+def _write_serial_frame(frame):
+    """在后台串口线程中发送一个完整数据帧。"""
     if SERIAL_SAFE_BYTE_WRITE:
-        # 与已验证的测试程序一致：每个字节写入后等待发送完成。
+        # 该Jetson ttyTHS串口已实机验证：逐字节写入才能保证数据正确。
         for index, value in enumerate(frame):
             written = serial_port.write(bytes((value,)))
             if written != 1:
@@ -497,6 +505,64 @@ def _send_frame(cmd_id, data_floats):
             total_written += written
         serial_port.flush()
 
+
+def _serial_worker():
+    """后台发送队列中的数据帧，避免阻塞相机采集和视觉处理。"""
+    global serial_enabled
+    while not serial_stop_event.is_set():
+        with serial_condition:
+            serial_condition.wait_for(
+                lambda: serial_pending_frames or serial_stop_event.is_set())
+            if serial_stop_event.is_set():
+                break
+            cmd_id = next(iter(serial_pending_frames))
+            frame = serial_pending_frames.pop(cmd_id)
+
+        try:
+            _write_serial_frame(frame)
+        except Exception as exc:
+            serial_enabled = False
+            serial_stop_event.set()
+            print(f"[SER] 后台发送失败: {exc}")
+            break
+
+
+def _send_frame(cmd_id, payload, flags=0, legacy_floats=None):
+    """生成V1或旧协议帧，并放入后台发送队列。"""
+    if PROTOCOL_MODE == "v1":
+        frame = proto.pack_frame(
+            cmd=cmd_id,
+            payload=payload,
+            flags=flags,
+            seq=protocol_sequence.next(),
+            src=PROTOCOL_SRC,
+            dst=PROTOCOL_DST,
+        )
+    elif PROTOCOL_MODE == "legacy":
+        if legacy_floats is None:
+            raise ValueError("旧协议缺少 float 数据")
+        frame = pack_legacy_frame(cmd_id, 0x0000, legacy_floats)
+    else:
+        raise ValueError(f"不支持的协议模式: {PROTOCOL_MODE}")
+
+    if SERIAL_DEBUG_HEX:
+        print(
+            f"[SER QUEUE] mode={PROTOCOL_MODE} cmd=0x{cmd_id:04X} "
+            f"len={len(frame)}: {frame.hex(' ')}")
+
+    # 每种命令只保留最新的待发帧，防止旧坐标积压导致延迟不断增大。
+    with serial_condition:
+        serial_pending_frames[cmd_id] = frame
+        serial_condition.notify()
+
+
+def send_heartbeat(uptime_ms, state=0, error_code=0):
+    """发送设备在线状态；旧协议模式下不发送。"""
+    if not serial_enabled or PROTOCOL_MODE != "v1":
+        return
+    payload = proto.pack_heartbeat_payload(uptime_ms, state, error_code)
+    _send_frame(proto.CMD_HEARTBEAT, payload)
+
 def send_points_to_mcu(outer_rect, inner_rect, red_spot):
     """发送A4矩形+红色光斑数据到下位机"""
     global serial_port, serial_enabled
@@ -507,26 +573,52 @@ def send_points_to_mcu(outer_rect, inner_rect, red_spot):
 
     # 帧3: A4外矩形 (cmd=0x0102)
     if outer_rect is not None:
-        data = []
+        legacy_data = []
         for p in outer_rect:
-            data.extend([float(p[0]), float(p[1])])
-        data += [0.0] * (12 - len(data))
-        _send_frame(0x0102, data)
-        print(f"[SER] 发送A4外矩形")
+            legacy_data.extend([float(p[0]), float(p[1])])
+        legacy_data += [0.0] * (12 - len(legacy_data))
+        payload = proto.pack_rect_payload(outer_rect)
+        _send_frame(
+            proto.CMD_OUTER_RECT,
+            payload,
+            flags=proto.FLAG_DATA_VALID,
+            legacy_floats=legacy_data,
+        )
+        if SERIAL_DEBUG_HEX:
+            print("[SER] 已队列A4外矩形")
 
     # 帧4: A4内矩形 (cmd=0x0103)
     if inner_rect is not None:
-        data = []
+        legacy_data = []
         for p in inner_rect:
-            data.extend([float(p[0]), float(p[1])])
-        data += [0.0] * (12 - len(data))
-        _send_frame(0x0103, data)
-        print(f"[SER] 发送A4内矩形")
+            legacy_data.extend([float(p[0]), float(p[1])])
+        legacy_data += [0.0] * (12 - len(legacy_data))
+        payload = proto.pack_rect_payload(inner_rect)
+        _send_frame(
+            proto.CMD_INNER_RECT,
+            payload,
+            flags=proto.FLAG_DATA_VALID,
+            legacy_floats=legacy_data,
+        )
+        if SERIAL_DEBUG_HEX:
+            print("[SER] 已队列A4内矩形")
 
     # 帧5: 红色光斑 (cmd=0x0104) - 持续发送
-    if red_spot is not None:
-        data = [float(red_spot[0]), float(red_spot[1])] + [0.0]*10
-        _send_frame(0x0104, data)
+    laser_valid = red_spot is not None
+    laser_x, laser_y = red_spot if laser_valid else (0, 0)
+    legacy_data = [float(laser_x), float(laser_y)] + [0.0] * 10
+    payload = proto.pack_laser_payload(
+        x=laser_x,
+        y=laser_y,
+        color=1,
+        confidence=100 if laser_valid else 0,
+    )
+    _send_frame(
+        proto.CMD_LASER_POINT,
+        payload,
+        flags=proto.FLAG_DATA_VALID if laser_valid else 0,
+        legacy_floats=legacy_data,
+    )
 
 def _print_data(outer_rect, inner_rect, red_spot):
     """无串口时打印数据到控制台"""
@@ -540,9 +632,17 @@ def _print_data(outer_rect, inner_rect, red_spot):
     print("=" * 50)
 
 def close_serial():
-    global serial_port, serial_enabled
+    global serial_port, serial_enabled, serial_thread
+    serial_stop_event.set()
+    with serial_condition:
+        serial_pending_frames.clear()
+        serial_condition.notify_all()
+    if serial_thread and serial_thread.is_alive():
+        serial_thread.join(timeout=2.0)
+    serial_thread = None
     if serial_port:
         serial_port.close()
+        serial_port = None
         serial_enabled = False
 
 print("[INFO] Serial communication OK")
@@ -658,6 +758,7 @@ def main():
     # --- 状态变量 ---
     frame_count = 0
     start_time = time.time()
+    last_heartbeat_time = 0.0
     send_counter = 0           # 串口发送计数器
     SEND_INTERVAL = 5          # 每N帧发送一次
     a4_locked = False          # A4内外矩形是否已锁定(只识别一次)
@@ -713,15 +814,21 @@ def main():
         # --- 红色光斑检测 ---
         red_spot_pos, red_mask = detect_red_spot(frame)
 
+        # --- 心跳，与是否检测到目标无关 ---
+        now = time.time()
+        if now - last_heartbeat_time >= HEARTBEAT_INTERVAL_S:
+            send_heartbeat(int((now - start_time) * 1000), state=0, error_code=0)
+            last_heartbeat_time = now
+
         # --- 处理鼠标点击 ---
         # (在主循环中处理, 通过键盘数字键分配)
 
         # --- 串口发送 (8点锁定后持续发送, 光斑检测不到发(0,0)) ---
         if a4_locked:
             send_counter += 1
-            spot = red_spot_pos if red_spot_pos is not None else (0, 0)
             if send_counter >= SEND_INTERVAL:
-                send_points_to_mcu(detected_outer_rect, detected_inner_rect, spot)
+                send_points_to_mcu(
+                    detected_outer_rect, detected_inner_rect, red_spot_pos)
                 send_counter = 0
 
         # --- 可视化 ---
