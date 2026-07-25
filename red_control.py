@@ -24,6 +24,7 @@ import sys, time, cv2, numpy as np, os, struct, threading
 from ctypes import *
 
 import protocol_v1 as proto
+import protocol_commands as commands
 
 # =============================================================================
 # 海康相机SDK导入
@@ -96,6 +97,8 @@ PROTOCOL_MODE = "v1"  # "v1" 为新通用协议，"legacy" 兼容旧54字节协�
 PROTOCOL_SRC = proto.DEVICE_VISION
 PROTOCOL_DST = proto.DEVICE_MAIN_MCU
 HEARTBEAT_INTERVAL_S = 0.5
+LASER_SEND_INTERVAL_S = 0.03  # 红色激光点约33Hz更新
+A4_REFRESH_INTERVAL_S = 2.0   # A4是静态数据，低频重发提高可靠性
 
 # --- 相机参数 ---
 CAM_WIDTH, CAM_HEIGHT = 640, 480
@@ -430,7 +433,6 @@ serial_thread = None
 serial_stop_event = threading.Event()
 serial_condition = threading.Condition()
 serial_pending_frames = {}
-protocol_sequence = proto.SequenceCounter()
 
 def init_serial(port=SERIAL_PORT, baudrate=SERIAL_BAUDRATE):
     """初始化串口"""
@@ -530,11 +532,10 @@ def _serial_worker():
 def _send_frame(cmd_id, payload, flags=0, legacy_floats=None):
     """生成V1或旧协议帧，并放入后台发送队列。"""
     if PROTOCOL_MODE == "v1":
-        frame = proto.pack_frame(
+        frame = proto.make_frame(
             cmd=cmd_id,
             payload=payload,
             flags=flags,
-            seq=protocol_sequence.next(),
             src=PROTOCOL_SRC,
             dst=PROTOCOL_DST,
         )
@@ -560,65 +561,78 @@ def send_heartbeat(uptime_ms, state=0, error_code=0):
     """发送设备在线状态；旧协议模式下不发送。"""
     if not serial_enabled or PROTOCOL_MODE != "v1":
         return
-    payload = proto.pack_heartbeat_payload(uptime_ms, state, error_code)
-    _send_frame(proto.CMD_HEARTBEAT, payload)
+    payload = struct.pack(
+        commands.FMT_HEARTBEAT,
+        int(uptime_ms) & 0xFFFFFFFF,
+        state & 0xFF,
+        error_code & 0xFF,
+    )
+    _send_frame(commands.CMD_HEARTBEAT, payload)
 
-def send_points_to_mcu(outer_rect, inner_rect, red_spot):
-    """发送A4矩形+红色光斑数据到下位机"""
+def send_a4_target(outer_rect, inner_rect):
+    """发送同一次识别得到的A4外框和内框四角点。"""
     global serial_port, serial_enabled
     if not serial_enabled:
-        print("[SER] 串口未启用, 仅打印数据")
-        _print_data(outer_rect, inner_rect, red_spot)
         return
 
-    # 帧3: A4外矩形 (cmd=0x0102)
-    if outer_rect is not None:
-        legacy_data = []
-        for p in outer_rect:
-            legacy_data.extend([float(p[0]), float(p[1])])
-        legacy_data += [0.0] * (12 - len(legacy_data))
-        payload = proto.pack_rect_payload(outer_rect)
-        _send_frame(
-            proto.CMD_OUTER_RECT,
-            payload,
-            flags=proto.FLAG_DATA_VALID,
-            legacy_floats=legacy_data,
-        )
-        if SERIAL_DEBUG_HEX:
-            print("[SER] 已队列A4外矩形")
+    valid = outer_rect is not None and inner_rect is not None
+    if valid:
+        outer = [int(value) for point in outer_rect for value in point]
+        inner = [int(value) for point in inner_rect for value in point]
+    else:
+        outer = [0] * 8
+        inner = [0] * 8
 
-    # 帧4: A4内矩形 (cmd=0x0103)
-    if inner_rect is not None:
-        legacy_data = []
-        for p in inner_rect:
-            legacy_data.extend([float(p[0]), float(p[1])])
-        legacy_data += [0.0] * (12 - len(legacy_data))
-        payload = proto.pack_rect_payload(inner_rect)
-        _send_frame(
-            proto.CMD_INNER_RECT,
-            payload,
-            flags=proto.FLAG_DATA_VALID,
-            legacy_floats=legacy_data,
-        )
-        if SERIAL_DEBUG_HEX:
-            print("[SER] 已队列A4内矩形")
+    payload = struct.pack(
+        commands.FMT_A4_TARGET,
+        CAM_WIDTH,
+        CAM_HEIGHT,
+        *outer,
+        *inner,
+    )
 
-    # 帧5: 红色光斑 (cmd=0x0104) - 持续发送
-    laser_valid = red_spot is not None
-    laser_x, laser_y = red_spot if laser_valid else (0, 0)
-    legacy_data = [float(laser_x), float(laser_y)] + [0.0] * 10
-    payload = proto.pack_laser_payload(
-        x=laser_x,
-        y=laser_y,
-        color=1,
-        confidence=100 if laser_valid else 0,
+    # 旧协议不支持合并A4帧，回退时仍分别发送内外框。
+    if PROTOCOL_MODE == "legacy":
+        if outer_rect is not None:
+            outer_legacy = [float(v) for v in outer] + [0.0] * 4
+            _send_frame(0x0102, b"", legacy_floats=outer_legacy)
+        if inner_rect is not None:
+            inner_legacy = [float(v) for v in inner] + [0.0] * 4
+            _send_frame(0x0103, b"", legacy_floats=inner_legacy)
+        return
+
+    _send_frame(
+        commands.CMD_A4_TARGET,
+        payload,
+        flags=proto.FLAG_DATA_VALID if valid else 0,
+    )
+
+
+def send_red_laser(red_spot):
+    """持续发送红色激光点坐标，未检测到时发送无效标志。"""
+    if not serial_enabled:
+        return
+
+    valid = red_spot is not None
+    x, y = red_spot if valid else (0, 0)
+    legacy_data = [float(x), float(y)] + [0.0] * 10
+    payload = struct.pack(
+        commands.FMT_RED_LASER,
+        int(x),
+        int(y),
     )
     _send_frame(
-        proto.CMD_LASER_POINT,
+        commands.CMD_RED_LASER,
         payload,
-        flags=proto.FLAG_DATA_VALID if laser_valid else 0,
+        flags=proto.FLAG_DATA_VALID if valid else 0,
         legacy_floats=legacy_data,
     )
+
+
+def send_points_to_mcu(outer_rect, inner_rect, red_spot):
+    """手动调试用：立即发送A4靶纸和当前红色激光点。"""
+    send_a4_target(outer_rect, inner_rect)
+    send_red_laser(red_spot)
 
 def _print_data(outer_rect, inner_rect, red_spot):
     """无串口时打印数据到控制台"""
@@ -759,8 +773,8 @@ def main():
     frame_count = 0
     start_time = time.time()
     last_heartbeat_time = 0.0
-    send_counter = 0           # 串口发送计数器
-    SEND_INTERVAL = 5          # 每N帧发送一次
+    last_laser_send_time = 0.0
+    last_a4_send_time = 0.0
     a4_locked = False          # A4内外矩形是否已锁定(只识别一次)
     force_redetect = False     # D键强制重新检测标志
 
@@ -791,6 +805,8 @@ def main():
         if not a4_locked or force_redetect:  # 只识别一次, 锁定后不再更新; D键强制重新检测
             if force_redetect:
                 force_redetect = False
+                detected_outer_rect = None
+                detected_inner_rect = None
                 print("[A4] 强制重新检测...")
             combined_img, binary_img, edges_img = preprocess_image(frame)
             contours, hierarchy = cv2.findContours(
@@ -803,13 +819,15 @@ def main():
                 detected_inner_rect = a4_rects[0][1]  # 内矩形角点
                 detected_outer_rect = a4_rects[1][1]  # 外矩形角点
                 a4_locked = True
+                last_a4_send_time = 0.0  # 新识别结果在本轮立即发送
                 print("[A4] 8点已锁定, 不再更新检测")
             elif len(a4_rects) == 1:
-                detected_outer_rect = a4_rects[0][1]
+                # A4合并帧必须使用同一帧内成对识别的内外框。
+                detected_outer_rect = None
                 detected_inner_rect = None
             else:
-                # 没有检测到, 保持上一次结果
-                pass
+                detected_outer_rect = None
+                detected_inner_rect = None
 
         # --- 红色光斑检测 ---
         red_spot_pos, red_mask = detect_red_spot(frame)
@@ -820,16 +838,18 @@ def main():
             send_heartbeat(int((now - start_time) * 1000), state=0, error_code=0)
             last_heartbeat_time = now
 
+        # 红色激光点与A4识别状态无关，始终按固定时间周期发送。
+        if now - last_laser_send_time >= LASER_SEND_INTERVAL_S:
+            send_red_laser(red_spot_pos)
+            last_laser_send_time = now
+
+        # A4内外框是静态路径数据：锁定后立即发送，并低频刷新。
+        if a4_locked and now - last_a4_send_time >= A4_REFRESH_INTERVAL_S:
+            send_a4_target(detected_outer_rect, detected_inner_rect)
+            last_a4_send_time = now
+
         # --- 处理鼠标点击 ---
         # (在主循环中处理, 通过键盘数字键分配)
-
-        # --- 串口发送 (8点锁定后持续发送, 光斑检测不到发(0,0)) ---
-        if a4_locked:
-            send_counter += 1
-            if send_counter >= SEND_INTERVAL:
-                send_points_to_mcu(
-                    detected_outer_rect, detected_inner_rect, red_spot_pos)
-                send_counter = 0
 
         # --- 可视化 ---
         display = frame.copy()
@@ -894,10 +914,13 @@ def main():
             red_spot_pos = None
             a4_locked = False
             force_redetect = False
+            send_a4_target(None, None)
             print("[RESET] 检测结果已重置, A4锁定解除")
 
         elif key == ord('d') or key == ord('D'):
+            a4_locked = False
             force_redetect = True
+            send_a4_target(None, None)
             print("[DETECT] 触发重新检测A4矩形...")
 
         elif key == ord('b') or key == ord('B'):
