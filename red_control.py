@@ -87,8 +87,8 @@ def _build_red_hsv_ranges():
 
 # --- 串口参数 ---
 SERIAL_PORT = "/dev/ttyTHS1"
-SERIAL_BAUDRATE = 115200
-SERIAL_DEBUG_HEX = False  # True时打印每个发送帧，供与MCU逐字节核对
+SERIAL_BAUDRATE = 921600
+SERIAL_DEBUG_HEX = True  # 打印实际交给串口驱动的每个字节
 
 # --- 相机参数 ---
 CAM_WIDTH, CAM_HEIGHT = 640, 480
@@ -452,13 +452,21 @@ def pack_frame(cmd_id, flags, data_floats):
     ``length`` 是帧头和长度字段之后的字节数。下位机按这个长度收取，
     因此这里不能额外附加校验字节；否则下一帧会从校验字节开始而失步。
     """
-    n = len(data_floats)
+    floats = [float(value) for value in data_floats]
+    n = len(floats)
     length = 2 + 2 + 4 * n  # cmd_id(2) + flags(2) + floats(4*n)
-    buf = bytearray([0xA5, length & 0xFF])
-    buf += struct.pack('<HH', cmd_id, flags)
-    for f in data_floats:
-        buf += struct.pack('<f', f)
-    return bytes(buf)
+    if length > 0xFF:
+        raise ValueError(f"数据过长: {length} 字节")
+
+    # 一次性打包，避免分段拼接时引入中间缓冲区问题。
+    return struct.pack(
+        f'<BBHH{n}f',
+        0xA5,
+        length,
+        cmd_id,
+        flags,
+        *floats,
+    )
 
 def _send_frame(cmd_id, data_floats):
     """发送完整帧，并在调试模式下输出实际发出的字节。"""
@@ -468,11 +476,18 @@ def _send_frame(cmd_id, data_floats):
         raise ValueError(
             f"帧长错误: length={frame[1]}, 实际={len(frame)}, 应为={expected_size}")
 
-    written = serial_port.write(frame)
-    if written != len(frame):
-        raise IOError(f"串口短写: {written}/{len(frame)} 字节")
     if SERIAL_DEBUG_HEX:
         print(f"[SER TX] cmd=0x{cmd_id:04X} len={len(frame)}: {frame.hex(' ')}")
+
+    # write() 理论上会写完，但这里仍按返回值循环，确保54字节全部交给驱动。
+    view = memoryview(frame)
+    total_written = 0
+    while total_written < len(frame):
+        written = serial_port.write(view[total_written:])
+        if not written:
+            raise IOError(f"串口短写: {total_written}/{len(frame)} 字节")
+        total_written += written
+    serial_port.flush()
 
 def send_points_to_mcu(outer_rect, inner_rect, red_spot):
     """发送A4矩形+红色光斑数据到下位机"""
