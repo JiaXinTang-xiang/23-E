@@ -481,7 +481,7 @@ def _send_frame(cmd_id, data_floats):
         print(f"[SER TX] cmd=0x{cmd_id:04X} len={len(frame)}: {frame.hex(' ')}")
 
     if SERIAL_SAFE_BYTE_WRITE:
-        # 每个字节单独写入并等待发送，避开 ttyTHS 批量写入/FIFO 路径。
+        # 与已验证的测试程序一致：每个字节写入后等待发送完成。
         for index, value in enumerate(frame):
             written = serial_port.write(bytes((value,)))
             if written != 1:
