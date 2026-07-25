@@ -20,7 +20,7 @@
   键盘 'Q'      - 退出
 """
 
-import sys, time, cv2, numpy as np, os, struct
+import sys, time, cv2, numpy as np, os, struct, threading
 from ctypes import *
 
 # =============================================================================
@@ -89,6 +89,7 @@ def _build_red_hsv_ranges():
 SERIAL_PORT = "/dev/ttyTHS1"
 SERIAL_BAUDRATE = 921600
 SERIAL_DEBUG_HEX = False  # True时打印完整发送帧
+SERIAL_SAFE_BYTE_WRITE = True  # 保留旧协议，仅避开当前Jetson的批量写入异常
 
 # --- 相机参数 ---
 CAM_WIDTH, CAM_HEIGHT = 640, 480
@@ -419,14 +420,35 @@ print("[INFO] Rectangle detection + red spot detection OK")
 # =============================================================================
 serial_port = None
 serial_enabled = False
+serial_thread = None
+serial_stop_event = threading.Event()
+serial_condition = threading.Condition()
+serial_pending_frames = {}
+
+
+def _write_serial_bytes(port, frame):
+    """发送完整帧；安全模式下使用已经实机验证的逐字节写入。"""
+    if SERIAL_SAFE_BYTE_WRITE:
+        for index, value in enumerate(frame):
+            written = port.write(bytes((value,)))
+            if written != 1:
+                raise IOError(f"串口短写: {index}/{len(frame)} 字节")
+            port.flush()
+        return
+
+    written = port.write(frame)
+    if written != len(frame):
+        raise IOError(f"串口短写: {written}/{len(frame)} 字节")
+    port.flush()
+
+
 def test_serial_communication(port=SERIAL_PORT, baudrate=SERIAL_BAUDRATE):
     """按参考代码的方式在正式启动前发送一次测试帧。"""
     try:
         import serial
         with serial.Serial(port, baudrate, timeout=1.0) as ser:
             test_data = b'\xA5\x0A\x01\x00\x00\x00\x00\x00\x00\x00'
-            ser.write(test_data)
-            ser.flush()
+            _write_serial_bytes(ser, test_data)
             time.sleep(0.1)
         print(f"[SER] 测试完成: {port} @ {baudrate}")
         return True
@@ -437,11 +459,17 @@ def test_serial_communication(port=SERIAL_PORT, baudrate=SERIAL_BAUDRATE):
 
 def init_serial(port=SERIAL_PORT, baudrate=SERIAL_BAUDRATE):
     """按参考代码的配置初始化串口。"""
-    global serial_port, serial_enabled
+    global serial_port, serial_enabled, serial_thread
     try:
         import serial
         serial_port = serial.Serial(port, baudrate, timeout=0.1)
         serial_enabled = True
+        serial_stop_event.clear()
+        with serial_condition:
+            serial_pending_frames.clear()
+        serial_thread = threading.Thread(
+            target=_serial_worker, name="serial-tx", daemon=True)
+        serial_thread.start()
         print(f"[SER] {port} @ {baudrate} OK")
         return True
     except Exception as e:
@@ -468,14 +496,37 @@ def pack_frame(cmd_id, flags, floats):
     return bytes(frame)
 
 
+def _serial_worker():
+    """在后台发送旧54字节协议帧，不阻塞视觉主线程。"""
+    global serial_enabled
+    while not serial_stop_event.is_set():
+        with serial_condition:
+            serial_condition.wait_for(
+                lambda: serial_pending_frames or serial_stop_event.is_set())
+            if serial_stop_event.is_set():
+                break
+            cmd_id = next(iter(serial_pending_frames))
+            frame = serial_pending_frames.pop(cmd_id)
+
+        try:
+            _write_serial_bytes(serial_port, frame)
+        except Exception as exc:
+            serial_enabled = False
+            serial_stop_event.set()
+            print(f"[SER] 后台发送失败: {exc}")
+            break
+
+
 def _send_frame(cmd_id, floats):
-    """一次性发送一个完整数据帧。"""
+    """生成旧54字节数据帧，放入后台发送队列。"""
     frame = pack_frame(cmd_id, 0x0000, floats)
-    written = serial_port.write(frame)
-    if written != len(frame):
-        raise IOError(f"串口短写: {written}/{len(frame)} 字节")
     if SERIAL_DEBUG_HEX:
         print(f"[SER TX] cmd=0x{cmd_id:04X} len={len(frame)}: {frame.hex(' ')}")
+
+    # 每种命令只保留最新一帧，避免串口较慢时积压旧坐标。
+    with serial_condition:
+        serial_pending_frames[cmd_id] = frame
+        serial_condition.notify()
 
 
 def send_points_to_mcu(outer_rect, inner_rect, red_spot):
@@ -510,7 +561,14 @@ def _print_data(outer_rect, inner_rect, red_spot):
     print("=" * 50)
 
 def close_serial():
-    global serial_port, serial_enabled
+    global serial_port, serial_enabled, serial_thread
+    serial_stop_event.set()
+    with serial_condition:
+        serial_pending_frames.clear()
+        serial_condition.notify_all()
+    if serial_thread and serial_thread.is_alive():
+        serial_thread.join(timeout=2.0)
+    serial_thread = None
     if serial_port:
         serial_port.close()
         serial_port = None
